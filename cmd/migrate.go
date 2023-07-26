@@ -85,74 +85,6 @@ type Command struct {
 
 var Cache PointsCache // 缓存
 
-func (cmd *Command) GetBatchPoints(batchPoints chan<- client.BatchPoints) {
-
-	result, err := cmd.RunQuery(fmt.Sprintf("SELECT * FROM %s.%s.%s WHERE time >= '%s' AND time < '%s'",
-		cmd.SourceConfig.Database, cmd.SourceConfig.RetentionPolicy, cmd.Measurements[cmd.Cursor.currentMeasurement], cmd.Cursor.startTime.Format(time.RFC3339Nano), cmd.Cursor.endTime.Format(time.RFC3339Nano)))
-	if err != nil {
-		log.Fatal(err)
-	}
-	if result.Results[0].Series == nil {
-		// log.Printf("measurement %s: %s - %s  no data", cmd.Measurements[cmd.Cursor.currentMeasurement], cmd.Cursor.startTime, cmd.Cursor.endTime)
-		return
-	}
-
-	name := result.Results[0].Series[0].Name
-	columns := result.Results[0].Series[0].Columns
-	tagKeys := cmd.GetTagKeys()
-	bp, err := client.NewBatchPoints(client.BatchPointsConfig{
-		Database:         cmd.TargetConfig.Database,
-		RetentionPolicy:  cmd.TargetConfig.RetentionPolicy,
-		WriteConsistency: cmd.Consistency,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	count := 0
-	for _, line := range result.Results[0].Series[0].Values {
-
-		var tags = make(map[string]string)
-		var fields = make(map[string]interface{})
-		ts, err := time.Parse(time.RFC3339Nano, line[0].(string))
-
-		if err != nil {
-			log.Fatal(err)
-		}
-		for i := 1; i < len(line); i++ {
-			if line[i] == nil {
-				continue
-			}
-
-			// 表示字段为 tag 类型
-			if ContainsString(tagKeys, columns[i]) {
-				tags[columns[i]] = line[i].(string)
-				// 否则为 field 类型
-			} else {
-				fields[columns[i]] = line[i]
-			}
-
-		}
-		point, err := client.NewPoint(name, tags, fields, ts)
-		if err != nil {
-			log.Fatal(err)
-		}
-		bp.AddPoint(point)
-		if cmd.BatchSize == count {
-			count = 0
-			atomic.AddInt64(&cmd.statistics.CachePoints, int64(len(bp.Points())))
-			batchPoints <- bp
-			bp, _ = client.NewBatchPoints(client.BatchPointsConfig{
-				Database:         cmd.TargetConfig.Database,
-				RetentionPolicy:  cmd.TargetConfig.RetentionPolicy,
-				WriteConsistency: cmd.Consistency,
-			})
-		}
-	}
-	batchPoints <- bp
-	atomic.AddInt64(&cmd.statistics.CachePoints, int64(len(bp.Points())))
-	cmd.CacheBar.Add(len(bp.Points()))
-}
-
 func (cmd *Command) Next() bool {
 	if cmd.Cursor.CurrentIntervalIterator < cmd.Cursor.MaxIntervalIterator && cmd.Cursor.currentMeasurement < cmd.Cursor.measurementSize-1 {
 		cmd.Cursor.currentMeasurement++
@@ -257,41 +189,74 @@ func (cmd *Command) migrate() error {
 	return nil
 }
 
-func (cmd *Command) Task() {
-	// 开始展示进度条
-	startTime := time.Now()
-	//cmd.ProgressBar.Start()
-	cmd.CacheBar = pb.StartNew(cmd.MaxCachePoints)
-	cache := NewPointsCache(cmd.MaxCachePoints)
+func GetBatchPoints(cmd *Command, batchPoints chan<- client.BatchPoints) {
+	result, err := cmd.RunQuery(fmt.Sprintf("SELECT * FROM %s.%s.%s WHERE time >= '%s' AND time < '%s'",
+		cmd.SourceConfig.Database, cmd.SourceConfig.RetentionPolicy, cmd.Measurements[cmd.Cursor.currentMeasurement], cmd.Cursor.startTime.Format(time.RFC3339Nano), cmd.Cursor.endTime.Format(time.RFC3339Nano)))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if result.Results[0].Series == nil {
+		// log.Printf("measurement %s: %s - %s  no data", cmd.Measurements[cmd.Cursor.currentMeasurement], cmd.Cursor.startTime, cmd.Cursor.endTime)
+		return
+	}
 
-	done := make(chan struct{}, 1)
+	name := result.Results[0].Series[0].Name
+	columns := result.Results[0].Series[0].Columns
+	tagKeys := cmd.GetTagKeys()
+	bp, err := client.NewBatchPoints(client.BatchPointsConfig{
+		Database:         cmd.TargetConfig.Database,
+		RetentionPolicy:  cmd.TargetConfig.RetentionPolicy,
+		WriteConsistency: cmd.Consistency,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	count := 0
+	for _, line := range result.Results[0].Series[0].Values {
 
-	go func() {
-		cmd.GetBatchPoints(cache.Points)
+		var tags = make(map[string]string)
+		var fields = make(map[string]interface{})
+		ts, err := time.Parse(time.RFC3339Nano, line[0].(string))
 
-		for cmd.Next() {
-			cmd.GetBatchPoints(cache.Points)
+		if err != nil {
+			log.Fatal(err)
 		}
-		// Close 'cache.Points' when 'cmd.Next()' returns false
+		for i := 1; i < len(line); i++ {
+			if line[i] == nil {
+				continue
+			}
 
-		close(cache.Points)
-	}()
+			// 表示字段为 tag 类型
+			if ContainsString(tagKeys, columns[i]) {
+				tags[columns[i]] = line[i].(string)
+				// 否则为 field 类型
+			} else {
+				fields[columns[i]] = line[i]
+			}
 
-	go func() {
-		cmd.WriteBatchPoints(cache.Points)
-		done <- struct{}{}
-	}()
-
-	<-done
-
-	//cmd.ProgressBar.Finish()
-	cmd.CacheBar.Finish()
-	cmd.statistics.TotalTime = time.Since(startTime)
-	log.Printf("Write %d Points, total time: %s", cmd.statistics.TotalPoints, cmd.statistics.TotalTime)
-	//os.Exit(0)
+		}
+		point, err := client.NewPoint(name, tags, fields, ts)
+		if err != nil {
+			log.Fatal(err)
+		}
+		bp.AddPoint(point)
+		if cmd.BatchSize == count {
+			count = 0
+			atomic.AddInt64(&cmd.statistics.CachePoints, int64(len(bp.Points())))
+			batchPoints <- bp
+			bp, _ = client.NewBatchPoints(client.BatchPointsConfig{
+				Database:         cmd.TargetConfig.Database,
+				RetentionPolicy:  cmd.TargetConfig.RetentionPolicy,
+				WriteConsistency: cmd.Consistency,
+			})
+		}
+	}
+	batchPoints <- bp
+	atomic.AddInt64(&cmd.statistics.CachePoints, int64(len(bp.Points())))
+	cmd.CacheBar.Add(len(bp.Points()))
 }
 
-func (cmd *Command) WriteBatchPoints(bps <-chan client.BatchPoints) {
+func WriteBatchPoints(cmd *Command, bps <-chan client.BatchPoints) {
 	for {
 		select {
 		case bp, ok := <-bps:
@@ -312,6 +277,39 @@ func (cmd *Command) WriteBatchPoints(bps <-chan client.BatchPoints) {
 			return
 		}
 	}
+}
+
+func (cmd *Command) Task() {
+	// 开始展示进度条
+	startTime := time.Now()
+	//cmd.ProgressBar.Start()
+	cmd.CacheBar = pb.StartNew(cmd.MaxCachePoints)
+	cache := NewPointsCache(cmd.MaxCachePoints)
+
+	done := make(chan struct{}, 1)
+
+	go func() {
+		GetBatchPoints(cmd, cache.Points)
+
+		for cmd.Next() {
+			GetBatchPoints(cmd, cache.Points)
+		}
+		// Close 'cache.Points' when 'cmd.Next()' returns false
+		close(cache.Points)
+	}()
+
+	go func() {
+		WriteBatchPoints(cmd, cache.Points)
+		done <- struct{}{}
+	}()
+
+	<-done
+
+	//cmd.ProgressBar.Finish()
+	cmd.CacheBar.Finish()
+	cmd.statistics.TotalTime = time.Since(startTime)
+	log.Printf("Write %d Points, total time: %s", cmd.statistics.TotalPoints, cmd.statistics.TotalTime)
+	//os.Exit(0)
 }
 
 func printMeta(cmd *Command) {
